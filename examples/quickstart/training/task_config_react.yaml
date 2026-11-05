@@ -1,6 +1,6 @@
 - name: swe_bench
   sandbox:
-    provider: vefaas
+    provider: k8s_agent_sandbox
     runtime_timeout: 7200
   agent:
     name: react
@@ -101,7 +101,30 @@
 
 - name: swe_rebench
   sandbox:
-    provider: vefaas
+    provider: k8s_agent_sandbox
+    runtime_timeout: 7200
+  agent:
+    name: react
+    max_steps: 200
+    tools:
+      - name: str_replace_editor
+      - name: stateful_shell
+        command_timeout: 120
+        env_vars:
+          PAGER: "cat"
+          GIT_PAGER: "cat"
+          MANPAGER: "cat"
+          TQDM_DISABLE: "1"
+          PIP_PROGRESS_BAR: "off"
+      - name: submit
+    sampling_params_override:
+      temperature: 1.0
+      top_p: 1.0
+  prompt_template: *swe_react_prompt
+
+- name: r2e_gym
+  sandbox:
+    provider: k8s_agent_sandbox
     runtime_timeout: 7200
   agent:
     name: react
@@ -124,7 +147,7 @@
 
 - name: swe_bench_multilingual
   sandbox:
-    provider: vefaas
+    provider: k8s_agent_sandbox
     runtime_timeout: 7200
   agent:
     name: react
