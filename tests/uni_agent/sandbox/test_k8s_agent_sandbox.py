@@ -92,7 +92,9 @@ class _FakeFleet:
     def unwarm_image(self, image: str) -> None:
         self.unwarm_images([image])
 
-    def wait_pools_ready(self, images: list[str], timeout: float | None = None, *, replicas: dict | None = None) -> dict[str, bool]:
+    def wait_pools_ready(
+        self, images: list[str], timeout: float | None = None, *, replicas: dict | None = None
+    ) -> dict[str, bool]:
         del timeout, replicas
         for img in images:
             assert img in self._warmed, f"wait_pools_ready called on unwarmed image {img}"
@@ -416,3 +418,28 @@ def test_cross_actor_lookahead_mode_registers_plan_without_warming(monkeypatch):
 
     asyncio.run(_worker_scenario())
 
+
+def test_write_file_chunks_large_payload_below_argv_limit(tmp_path):
+    import asyncio
+    import os
+    import subprocess
+
+    from uni_agent.sandbox.base import ExecResult
+    from uni_agent.sandbox.k8s_agent_sandbox import _WRITE_FILE_CHUNK_CHARS, K8sAgentSandbox
+
+    class _LocalShellSandbox(K8sAgentSandbox):
+        max_script = 0
+
+        async def exec_shell(self, script, *, timeout=None, workdir=None, env=None):
+            type(self).max_script = max(type(self).max_script, len(script))
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            return ExecResult(exit_code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    sandbox = _LocalShellSandbox(image="python:3.12")
+    for size in (10, 3 * 1024 * 1024 + 7):
+        data = os.urandom(size)
+        target = tmp_path / "nested" / f"f{size}.bin"
+        asyncio.run(sandbox.write_file(str(target), data))
+        assert target.read_bytes() == data
+    # Every exec argument stays far below Linux MAX_ARG_STRLEN (128 KiB).
+    assert _LocalShellSandbox.max_script < _WRITE_FILE_CHUNK_CHARS + 1024 < 128 * 1024
