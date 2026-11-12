@@ -4,7 +4,7 @@
     runtime_timeout: 7200
   agent:
     name: react
-    max_steps: 200
+    max_steps: 30
     tools:
       - name: str_replace_editor
       - name: stateful_shell
@@ -105,7 +105,7 @@
     runtime_timeout: 7200
   agent:
     name: react
-    max_steps: 200
+    max_steps: 30
     tools:
       - name: str_replace_editor
       - name: stateful_shell
@@ -128,7 +128,7 @@
     runtime_timeout: 7200
   agent:
     name: react
-    max_steps: 200
+    max_steps: 30
     tools:
       - name: str_replace_editor
       - name: stateful_shell
@@ -151,7 +151,7 @@
     runtime_timeout: 7200
   agent:
     name: react
-    max_steps: 200
+    max_steps: 30
     tools:
       - name: str_replace_editor
       - name: stateful_shell
