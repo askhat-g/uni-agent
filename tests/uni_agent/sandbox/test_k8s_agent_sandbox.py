@@ -25,7 +25,8 @@ from uni_agent.sandbox.k8s_agent_sandbox import (
     wait_eval_sandbox_images_ready,
 )
 from uni_agent.tasks import TaskConfigResolver, get_task
-from uni_agent.tasks.r2e_gym import R2EGymTask, compute_reward, parse_log_pytest
+from uni_agent.tasks.r2e_gym.reward import compute_reward, parse_log_pytest
+from uni_agent.tasks.r2e_gym.task import R2EGymTask
 
 
 @dataclass
