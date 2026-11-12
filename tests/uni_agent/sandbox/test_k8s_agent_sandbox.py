@@ -219,6 +219,7 @@ def test_task_config_react_resolves_r2e_gym_and_swe():
         )
         assert resolved["sandbox"]["provider"] == "k8s_agent_sandbox"
         assert resolved["agent"]["name"] == "react"
+        assert resolved["agent"]["max_steps"] == 30
         if task_name == "r2e_gym":
             assert isinstance(get_task(resolved), R2EGymTask)
 
