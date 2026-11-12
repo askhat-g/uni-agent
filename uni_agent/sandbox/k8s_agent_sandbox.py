@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import re
@@ -10,6 +11,8 @@ import shlex
 import threading
 import time
 import uuid
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import ExecResult, Sandbox
@@ -28,23 +31,69 @@ except ImportError:
     k8s_stream = None  # type: ignore[assignment]
 
 try:
-    from agent_sandbox_rl import ClusterConfig, FleetConfig, SandboxFleet, Task
     import agent_sandbox_rl.resources as asrl_resources
+    from agent_sandbox_rl import ClusterConfig, FleetConfig, SandboxFleet, Task
+    from agent_sandbox_rl.config import TemplateSpec
+    from agent_sandbox_rl.lookahead import LookaheadWarmer
 except ImportError:
     ClusterConfig = None  # type: ignore[assignment]
     FleetConfig = None  # type: ignore[assignment]
     SandboxFleet = None  # type: ignore[assignment]
     Task = None  # type: ignore[assignment]
+    TemplateSpec = None  # type: ignore[assignment]
+    LookaheadWarmer = None  # type: ignore[assignment]
     asrl_resources = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
 RUNTIME_CONTAINER_NAME = "agent-runtime"
 _PWD_SENTINEL = "__UNI_AGENT_PWD__"
+EVAL_PINNED_BATCH_ID = "eval_pinned"
 
 _FLEET_LOCK = threading.Lock()
 _GLOBAL_FLEET: Any = None
+_GLOBAL_LOOKAHEAD_WARMER: Any = None
+_LOOKAHEAD_FUTURES: dict[int | str, Future[Any]] = {}
+_PINNED_EVAL_IMAGES: list[str] = []
 _TEMPLATES_PATCHED = False
+_ACTIVE_CLAIMS: dict[str, int] = {}
+_RECENT_BATCH_IMAGES: collections.deque[set[str]] = collections.deque(maxlen=4)
+_IDLE_LRU: collections.OrderedDict[str, None] = collections.OrderedDict()
+
+# Separate executors so cold sandbox claim waits never starve active pod exec calls.
+# Initialized lazily so importing this module or pickling Ray actors never touches a ThreadPoolExecutor.
+_EXECUTOR_LOCK = threading.Lock()
+_LIFECYCLE_EXECUTOR: ThreadPoolExecutor | None = None
+_EXEC_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def get_lifecycle_executor() -> ThreadPoolExecutor:
+    global _LIFECYCLE_EXECUTOR
+    if _LIFECYCLE_EXECUTOR is None:
+        with _EXECUTOR_LOCK:
+            if _LIFECYCLE_EXECUTOR is None:
+                _LIFECYCLE_EXECUTOR = ThreadPoolExecutor(max_workers=128, thread_name_prefix="k8s-sb-lifecycle")
+    return _LIFECYCLE_EXECUTOR
+
+
+def get_exec_executor() -> ThreadPoolExecutor:
+    global _EXEC_EXECUTOR
+    if _EXEC_EXECUTOR is None:
+        with _EXECUTOR_LOCK:
+            if _EXEC_EXECUTOR is None:
+                _EXEC_EXECUTOR = ThreadPoolExecutor(max_workers=256, thread_name_prefix="k8s-sb-exec")
+    return _EXEC_EXECUTOR
+
+
+def normalize_sandbox_image(image: str) -> str:
+    """Rewrite upstream R2E-Gym DockerHub image references to the configured mirror prefix."""
+    image_prefix = os.getenv("SANDBOX_IMAGE_PREFIX", "").strip().rstrip("/")
+    if image_prefix and image:
+        if image.startswith("namanjain12/"):
+            return f"{image_prefix}/{image.split('/', 1)[1]}"
+        if "/" not in image:
+            return f"{image_prefix}/{image}"
+    return image
 
 
 def _read_in_cluster_namespace() -> str | None:
@@ -66,6 +115,13 @@ def _resolve_default_namespace(namespace: str | None = None) -> str:
         if val:
             return val
     return _read_in_cluster_namespace() or "default"
+
+
+def _resolve_default_node_selector(node_selector: dict[str, str] | None = None) -> dict[str, str] | None:
+    if node_selector is not None:
+        return dict(node_selector)
+    k, v = os.getenv("NODE_SELECTOR_KEY"), os.getenv("NODE_SELECTOR_VAL")
+    return {k: v} if (k and v) else None
 
 
 def patch_agent_sandbox_rl_templates() -> None:
@@ -115,22 +171,725 @@ def patch_agent_sandbox_rl_templates() -> None:
         _TEMPLATES_PATCHED = True
 
 
-def ensure_tasks_in_fleet_plan(fleet: Any, tasks: list[Any], *, warm: bool = True) -> None:
-    """Registers ``tasks`` in ``fleet.plan_`` and creates warm pools for new images."""
-    with _FLEET_LOCK:
-        new_images = [
-            t.image
-            for t in tasks
-            if getattr(t, "image", None) and (fleet.plan_ is None or fleet.plan_.for_image(t.image) is None)
-        ]
-        new_images = list(dict.fromkeys(new_images))
-        if new_images or fleet.plan_ is None:
-            existing = list(fleet.tasks) if getattr(fleet, "tasks", None) else []
-            fleet.load_tasks(existing + tasks)
+def _get_or_init_fleet_locked(
+    *,
+    namespace: str,
+    node_selector: dict[str, str] | None,
+) -> Any:
+    global _GLOBAL_FLEET, _RECENT_BATCH_IMAGES
+    if _GLOBAL_FLEET is not None:
+        return _GLOBAL_FLEET
+    if ClusterConfig is None or FleetConfig is None or SandboxFleet is None:
+        raise ImportError("K8sAgentSandbox requires 'agent_sandbox_rl'.")
+
+    patch_agent_sandbox_rl_templates()
+    adopt_existing = os.getenv("SANDBOX_ADOPT_EXISTING", "0").strip().lower() in ("1", "true", "yes")
+    run_id = os.getenv("SANDBOX_RUN_ID", "uni-agent-shared").strip() or None
+    default_isolation = "none" if (adopt_existing or run_id in (None, "uni-agent-shared")) else "names"
+    run_isolation = os.getenv("SANDBOX_RUN_ISOLATION", default_isolation).strip() or default_isolation
+    max_concurrent = max(1, int(os.getenv("SANDBOX_MAX_CONCURRENT", "512")))
+    max_warmpool_size = max(1, int(os.getenv("SANDBOX_MAX_WARMPOOL_SIZE", "8")))
+    colocate_replicas = os.getenv("SANDBOX_COLOCATE_REPLICAS", "1").strip().lower() in ("1", "true", "yes")
+    pinned_batches = max(1, int(os.getenv("SANDBOX_PINNED_BATCHES", "4")))
+    _RECENT_BATCH_IMAGES = collections.deque(_RECENT_BATCH_IMAGES, maxlen=pinned_batches)
+
+    fleet_kwargs: dict[str, Any] = {
+        "clusters": [
+            ClusterConfig(
+                name="default",
+                namespace=namespace,
+                node_selector=node_selector,
+                in_cluster=os.getenv("KUBERNETES_SERVICE_HOST") is not None,
+            )
+        ],
+        "max_concurrent": max_concurrent,
+        "window_size": 16,
+        "max_warmpool_size": max_warmpool_size,
+        "warm_per_task": True,
+        "adopt_existing": adopt_existing,
+        "run_isolation": run_isolation,
+        "run_id": run_id,
+        "install_teardown_hooks": True,
+    }
+    if TemplateSpec is not None:
+        fleet_kwargs["template"] = TemplateSpec(
+            colocate_replicas=colocate_replicas,
+            network_policy_management="Unmanaged",
+        )
+
+    cfg = FleetConfig(**fleet_kwargs)
+    _GLOBAL_FLEET = SandboxFleet(cfg)
+    _GLOBAL_FLEET._install_teardown_hooks()
+    logger.info(
+        "Initialized K8s SandboxFleet (namespace=%s, run_id=%s, run_isolation=%s, max_warmpool_size=%d, colocate=%s)",
+        namespace,
+        run_id,
+        run_isolation,
+        max_warmpool_size,
+        colocate_replicas,
+    )
+    return _GLOBAL_FLEET
+
+
+def _register_and_warm_locked(
+    fleet: Any,
+    tasks: list[Any],
+    *,
+    warm: bool = True,
+    replicas_override: int | None = None,
+) -> None:
+    unique_tasks: list[Any] = []
+    seen_images: set[str] = set()
+    for t in tasks:
+        img = getattr(t, "image", None)
+        if img and img not in seen_images:
+            seen_images.add(img)
+            unique_tasks.append(t)
+    if not unique_tasks:
+        return
+
+    unplanned = [t for t in unique_tasks if fleet.plan_ is None or fleet.plan_.for_image(t.image) is None]
+    if unplanned:
+        if fleet.plan_ is None:
+            fleet.load_tasks(unplanned)
             fleet.plan()
-            if warm and new_images and hasattr(fleet, "warm_images"):
-                replicas = getattr(getattr(fleet, "config", None), "max_warmpool_size", None) or 4
-                fleet.warm_images(new_images, replicas_override=replicas, wait=False)
+        elif hasattr(fleet, "add_tasks"):
+            fleet.add_tasks(unplanned)
+        else:
+            existing = list(fleet.tasks) if getattr(fleet, "tasks", None) else []
+            fleet.load_tasks(existing + unplanned)
+            fleet.plan()
+
+    for t in unique_tasks:
+        _IDLE_LRU[t.image] = None
+        _IDLE_LRU.move_to_end(t.image)
+
+    if warm and hasattr(fleet, "warm_images"):
+        warmed_map = getattr(fleet, "_warmed", None)
+        # Re-warm images that were evicted across epochs even when still present in fleet.plan_.
+        to_warm = (
+            [t.image for t in unique_tasks if t.image not in warmed_map]
+            if isinstance(warmed_map, dict)
+            else [t.image for t in unplanned]
+        )
+        if to_warm:
+            default_reps = getattr(getattr(fleet, "config", None), "max_warmpool_size", None) or 8
+            reps = max(1, min(int(replicas_override), default_reps)) if replicas_override is not None else default_reps
+            fleet.warm_images(to_warm, replicas_override=reps, wait=False)
+
+
+def _is_lookahead_mode_enabled() -> bool:
+    """Return True when warm-pool lifecycle is managed by a ``LookaheadWarmer`` (local or trainer actor)."""
+    return _GLOBAL_LOOKAHEAD_WARMER is not None or os.getenv("VERL_SANDBOX_LOOKAHEAD", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _evict_excess_warmpools_locked(fleet: Any) -> list[str]:
+    """Unwarm oldest zero-claim, unpinned warm pools once active pool count exceeds SANDBOX_MAX_WARM_IMAGES."""
+    if _is_lookahead_mode_enabled():
+        return []
+    if getattr(getattr(fleet, "config", None), "adopt_existing", False) or not hasattr(fleet, "unwarm_images"):
+        return []
+    max_warm_images = int(os.getenv("SANDBOX_MAX_WARM_IMAGES", "128"))
+    if max_warm_images <= 0:
+        return []
+    warmed_map = getattr(fleet, "_warmed", None)
+    if not isinstance(warmed_map, dict) or len(warmed_map) <= max_warm_images:
+        return []
+
+    for img in warmed_map:
+        if img not in _IDLE_LRU:
+            _IDLE_LRU[img] = None
+    pinned: set[str] = set().union(*_RECENT_BATCH_IMAGES) if _RECENT_BATCH_IMAGES else set()
+    excess = len(warmed_map) - max_warm_images
+    to_evict: list[str] = []
+    for img in list(_IDLE_LRU.keys()):
+        if len(to_evict) >= excess:
+            break
+        if img not in warmed_map:
+            _IDLE_LRU.pop(img, None)
+            continue
+        if _ACTIVE_CLAIMS.get(img, 0) > 0 or img in pinned:
+            continue
+        to_evict.append(img)
+
+    if to_evict:
+        try:
+            fleet.unwarm_images(to_evict)
+            for img in to_evict:
+                if img not in warmed_map:
+                    _IDLE_LRU.pop(img, None)
+            logger.info(
+                "Evicted %d idle sandbox warm pool(s) (active_warm=%d, limit=%d)",
+                len(to_evict),
+                len(warmed_map),
+                max_warm_images,
+            )
+        except Exception:
+            logger.warning("Failed to evict idle sandbox warm pools: %s", to_evict[:3], exc_info=True)
+    return to_evict
+
+
+def _extract_image_from_mapping(item: Any) -> str | None:
+    if isinstance(item, str):
+        return item.strip() or None
+    if not isinstance(item, dict):
+        return None
+    tools_kwargs = item.get("tools_kwargs")
+    if not isinstance(tools_kwargs, dict):
+        extra_info = item.get("extra_info")
+        if isinstance(extra_info, dict):
+            tools_kwargs = extra_info.get("tools_kwargs")
+    if isinstance(tools_kwargs, dict):
+        task_dict = tools_kwargs.get("task") if isinstance(tools_kwargs.get("task"), dict) else tools_kwargs
+    elif isinstance(item.get("task"), dict):
+        task_dict = item["task"]
+    else:
+        task_dict = item
+    sandbox_cfg = task_dict.get("sandbox")
+    if isinstance(sandbox_cfg, dict):
+        img = sandbox_cfg.get("image")
+        if isinstance(img, str) and img.strip():
+            return img.strip()
+    meta_cfg = task_dict.get("metadata")
+    if isinstance(meta_cfg, dict):
+        img = meta_cfg.get("docker_image")
+        if isinstance(img, str) and img.strip():
+            return img.strip()
+    img = task_dict.get("docker_image") or task_dict.get("image")
+    if isinstance(img, str) and img.strip():
+        return img.strip()
+    return None
+
+
+def _maybe_dedup_images(images: list[str], *, deduplicate: bool) -> list[str]:
+    if not deduplicate:
+        return images
+    return list(dict.fromkeys(images))
+
+
+def extract_sandbox_images(batch_or_items: Any, *, deduplicate: bool = False) -> list[str]:
+    """Extract normalized sandbox Docker images from a batch (TensorDict/dict), dataset, or item list."""
+    if batch_or_items is None:
+        return []
+    dataframe = getattr(batch_or_items, "dataframe", None)
+    if dataframe is not None:
+        batch_or_items = dataframe
+    if hasattr(batch_or_items, "to_dict") and hasattr(batch_or_items, "columns"):
+        # pandas.DataFrame or HuggingFace Dataset with columns
+        try:
+            records = batch_or_items.to_dict(orient="records")
+        except TypeError:
+            records = list(batch_or_items)
+        images = [
+            normalize_sandbox_image(img)
+            for item in records
+            if (img := _extract_image_from_mapping(item))
+        ]
+        return _maybe_dedup_images(images, deduplicate=deduplicate)
+    if isinstance(batch_or_items, dict) or hasattr(batch_or_items, "keys"):
+        for key in ("tools_kwargs", "extra_info"):
+            try:
+                col = batch_or_items[key]
+            except Exception:
+                col = None
+            if col is not None:
+                if isinstance(col, dict):
+                    items = [col]
+                elif hasattr(col, "tolist"):
+                    items = col.tolist()
+                else:
+                    items = list(col)
+                extracted: list[str] = []
+                for elem in items:
+                    wrapped = {key: elem} if isinstance(elem, dict) and key not in elem else elem
+                    img = _extract_image_from_mapping(wrapped)
+                    if img:
+                        extracted.append(normalize_sandbox_image(img))
+                if extracted:
+                    return _maybe_dedup_images(extracted, deduplicate=deduplicate)
+        if isinstance(batch_or_items, dict):
+            single = _extract_image_from_mapping(batch_or_items)
+            return [normalize_sandbox_image(single)] if single else []
+    if isinstance(batch_or_items, str):
+        return [normalize_sandbox_image(batch_or_items)]
+    images = []
+    try:
+        iterator = iter(batch_or_items)
+    except TypeError:
+        return images
+    for item in iterator:
+        img = _extract_image_from_mapping(item)
+        if img:
+            images.append(normalize_sandbox_image(img))
+    return _maybe_dedup_images(images, deduplicate=deduplicate)
+
+
+def _get_or_init_lookahead_warmer_locked(fleet: Any) -> Any:
+    global _GLOBAL_LOOKAHEAD_WARMER
+    if _GLOBAL_LOOKAHEAD_WARMER is not None and getattr(_GLOBAL_LOOKAHEAD_WARMER, "fleet", None) is fleet:
+        return _GLOBAL_LOOKAHEAD_WARMER
+    warmer_cls = LookaheadWarmer or _FallbackLookaheadWarmer
+    cap = getattr(getattr(fleet, "config", None), "max_warmpool_size", None) or 8
+    _GLOBAL_LOOKAHEAD_WARMER = warmer_cls(
+        fleet,
+        cap=cap,
+        keep_finished=0,
+        max_workers=32,
+        fail_fast=False,
+        register_images=True,
+    )
+    return _GLOBAL_LOOKAHEAD_WARMER
+
+
+class _FallbackLookaheadWarmer:
+    """Built-in fallback when ``agent_sandbox_rl.lookahead.LookaheadWarmer`` is not installed."""
+
+    def __init__(
+        self,
+        fleet: Any,
+        *,
+        cap: int = 8,
+        keep_finished: int = 0,
+        max_workers: int = 32,
+        fail_fast: bool = False,
+        register_images: bool = True,
+    ) -> None:
+        del max_workers, fail_fast, register_images
+        self.fleet = fleet
+        self.cap = cap
+        self.keep_finished = keep_finished
+        self._lock = threading.Lock()
+        self._live: collections.OrderedDict[int | str, dict[str, int]] = collections.OrderedDict()
+        self._finished: collections.deque[dict[str, int]] = collections.deque(maxlen=max(0, keep_finished))
+        self._applied: dict[str, int] = {}
+        self._executor: ThreadPoolExecutor | None = None
+
+    def _desired_locked(self) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for counts in list(self._live.values()) + list(self._finished):
+            for img, n in counts.items():
+                totals[img] = min(self.cap, totals.get(img, 0) + int(n))
+        return totals
+
+    def _reconcile(self) -> None:
+        with self._lock:
+            desired = self._desired_locked()
+            to_unwarm = [img for img in list(self._applied) if img not in desired]
+            to_warm = [(img, n) for img, n in desired.items() if self._applied.get(img) != n]
+            for img in to_unwarm:
+                self._applied.pop(img, None)
+            for img, n in to_warm:
+                self._applied[img] = n
+        if to_unwarm:
+            if hasattr(self.fleet, "unwarm_images"):
+                self.fleet.unwarm_images(to_unwarm)
+            elif hasattr(self.fleet, "unwarm"):
+                for img in to_unwarm:
+                    self.fleet.unwarm(img)
+        for img, n in to_warm:
+            if hasattr(self.fleet, "warm_image"):
+                self.fleet.warm_image(img, replicas_override=n, wait=False)
+            elif hasattr(self.fleet, "warm"):
+                self.fleet.warm(img, replicas=n)
+
+    def add(
+        self,
+        batch_id: int | str,
+        counts: dict[str, int],
+        *,
+        wait: bool = False,
+        wait_timeout: float | None = None,
+    ) -> None:
+        with self._lock:
+            self._live[batch_id] = dict(counts)
+        self._reconcile()
+        if wait:
+            self.wait_ready(counts.keys(), timeout=wait_timeout, replicas=counts)
+
+    def add_async(
+        self,
+        batch_id: int | str,
+        counts: dict[str, int],
+        *,
+        wait: bool = False,
+        wait_timeout: float | None = None,
+    ) -> Future[Any]:
+        with self._lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lookahead-warm")
+            ex = self._executor
+        return ex.submit(self.add, batch_id, counts, wait=wait, wait_timeout=wait_timeout)
+
+    def finish(self, batch_id: int | str) -> None:
+        with self._lock:
+            counts = self._live.pop(batch_id, None)
+            if counts is None:
+                return
+            if self.keep_finished:
+                self._finished.append(counts)
+        self._reconcile()
+
+    def wait_ready(
+        self,
+        images: Any,
+        *,
+        timeout: float | None = None,
+        replicas: dict[str, int] | None = None,
+    ) -> dict[str, bool]:
+        wait_fn = getattr(self.fleet, "wait_pools_ready", None) or getattr(self.fleet, "wait_warm_ready", None)
+        if callable(wait_fn):
+            return wait_fn(list(images), timeout=timeout, replicas=replicas)
+        return {img: True for img in images}
+
+    def close(self) -> None:
+        with self._lock:
+            ex, self._executor = self._executor, None
+            self._live.clear()
+            self._finished.clear()
+        if ex is not None:
+            ex.shutdown(wait=True)
+
+
+def _build_image_counts(
+    images: list[str],
+    *,
+    replicas_override: int | None = None,
+    max_replicas: int = 8,
+) -> tuple[list[str], dict[str, int]]:
+    normalized = [normalize_sandbox_image(img) for img in images if img]
+    unique_images = list(dict.fromkeys(normalized))
+    per_prompt = max(1, min(int(replicas_override), max_replicas)) if replicas_override is not None else max_replicas
+    counts: dict[str, int] = collections.OrderedDict()
+    for img in normalized:
+        counts[img] = min(max_replicas, counts.get(img, 0) + per_prompt)
+    return unique_images, counts
+
+
+def pin_eval_sandbox_images(
+    images: list[str],
+    *,
+    replicas: int | None = None,
+    replicas_override: int = 1,
+    wait: bool = False,
+    wait_timeout: float | None = None,
+    namespace: str | None = None,
+    node_selector: dict[str, str] | None = None,
+) -> list[str]:
+    """Register and pin evaluation sandbox images under ``EVAL_PINNED_BATCH_ID`` so they remain warm across steps."""
+    global _PINNED_EVAL_IMAGES
+    if ClusterConfig is None or FleetConfig is None or SandboxFleet is None or Task is None:
+        return []
+    eff_replicas = replicas if replicas is not None else replicas_override
+    resolved_ns = _resolve_default_namespace(namespace)
+    resolved_sel = _resolve_default_node_selector(node_selector)
+    with _FLEET_LOCK:
+        fleet = _get_or_init_fleet_locked(namespace=resolved_ns, node_selector=resolved_sel)
+        max_reps = getattr(getattr(fleet, "config", None), "max_warmpool_size", None) or 8
+        unique_images, counts = _build_image_counts(
+            images,
+            replicas_override=eff_replicas,
+            max_replicas=max_reps,
+        )
+        if not unique_images:
+            return []
+        task_objs = [Task(id=img, image=img, metadata={"ds": {"docker_image": img}}) for img in unique_images]
+        _register_and_warm_locked(fleet, task_objs, warm=False)
+        warmer = _get_or_init_lookahead_warmer_locked(fleet)
+        _PINNED_EVAL_IMAGES = list(unique_images)
+    if warmer is None:
+        return list(unique_images)
+    if wait:
+        warmer.add(EVAL_PINNED_BATCH_ID, counts, wait=True, wait_timeout=wait_timeout)
+    else:
+        fut = warmer.add_async(EVAL_PINNED_BATCH_ID, counts, wait=False)
+        with _FLEET_LOCK:
+            _LOOKAHEAD_FUTURES[EVAL_PINNED_BATCH_ID] = fut
+    return list(unique_images)
+
+
+def wait_eval_sandbox_images_ready(timeout: float | None = None) -> dict[str, bool]:
+    """Wait for pinned evaluation sandbox pools to be Ready before validation runs."""
+    with _FLEET_LOCK:
+        warmer = _GLOBAL_LOOKAHEAD_WARMER
+        fut = _LOOKAHEAD_FUTURES.pop(EVAL_PINNED_BATCH_ID, None)
+        eval_imgs = list(_PINNED_EVAL_IMAGES)
+    if warmer is None or not eval_imgs:
+        return {}
+    if fut is not None:
+        fut.result()
+    return warmer.wait_ready(
+        eval_imgs,
+        timeout=timeout,
+        replicas={img: 1 for img in eval_imgs},
+    )
+
+
+def ensure_lookahead_batch_warm(
+    batch_id: int | str,
+    images: list[str],
+    *,
+    replicas_override: int | None = None,
+    wait: bool = True,
+    wait_timeout: float | None = None,
+    namespace: str | None = None,
+    node_selector: dict[str, str] | None = None,
+) -> None:
+    """Ensure ``batch_id`` is registered and warmed (awaiting any prior background prefetch for ``batch_id``)."""
+    if ClusterConfig is None or FleetConfig is None or SandboxFleet is None or Task is None:
+        return
+    resolved_ns = _resolve_default_namespace(namespace)
+    resolved_sel = _resolve_default_node_selector(node_selector)
+    with _FLEET_LOCK:
+        fleet = _get_or_init_fleet_locked(namespace=resolved_ns, node_selector=resolved_sel)
+        max_reps = getattr(getattr(fleet, "config", None), "max_warmpool_size", None) or 8
+        unique_images, counts = _build_image_counts(
+            images,
+            replicas_override=replicas_override,
+            max_replicas=max_reps,
+        )
+        if not unique_images:
+            return
+        task_objs = [Task(id=img, image=img, metadata={"ds": {"docker_image": img}}) for img in unique_images]
+        _register_and_warm_locked(fleet, task_objs, warm=False)
+        warmer = _get_or_init_lookahead_warmer_locked(fleet)
+        fut = _LOOKAHEAD_FUTURES.pop(batch_id, None)
+    if warmer is None:
+        return
+    if fut is not None:
+        fut.result()
+        if wait:
+            warmer.wait_ready(counts.keys(), timeout=wait_timeout, replicas=counts)
+    elif batch_id in getattr(warmer, "_live", {}):
+        if wait:
+            warmer.wait_ready(counts.keys(), timeout=wait_timeout, replicas=counts)
+    else:
+        warmer.add(batch_id, counts, wait=wait, wait_timeout=wait_timeout)
+
+
+def prefetch_lookahead_batch_async(
+    batch_id: int | str,
+    images: list[str],
+    *,
+    replicas_override: int | None = None,
+    namespace: str | None = None,
+    node_selector: dict[str, str] | None = None,
+) -> None:
+    """Start warming ``batch_id``'s sandbox pools asynchronously in the background via ``LookaheadWarmer``."""
+    if ClusterConfig is None or FleetConfig is None or SandboxFleet is None or Task is None:
+        return
+    resolved_ns = _resolve_default_namespace(namespace)
+    resolved_sel = _resolve_default_node_selector(node_selector)
+    with _FLEET_LOCK:
+        fleet = _get_or_init_fleet_locked(namespace=resolved_ns, node_selector=resolved_sel)
+        max_reps = getattr(getattr(fleet, "config", None), "max_warmpool_size", None) or 8
+        unique_images, counts = _build_image_counts(
+            images,
+            replicas_override=replicas_override,
+            max_replicas=max_reps,
+        )
+        if not unique_images:
+            return
+        task_objs = [Task(id=img, image=img, metadata={"ds": {"docker_image": img}}) for img in unique_images]
+        _register_and_warm_locked(fleet, task_objs, warm=False)
+        warmer = _get_or_init_lookahead_warmer_locked(fleet)
+    if warmer is None:
+        return
+    fut = warmer.add_async(batch_id, counts, wait=False)
+    with _FLEET_LOCK:
+        _LOOKAHEAD_FUTURES[batch_id] = fut
+
+
+def finish_lookahead_batch_async(batch_id: int | str, *, wait: bool = False) -> None:
+    """Retire ``batch_id`` from ``LookaheadWarmer`` and tear down its unneeded warm pools."""
+    with _FLEET_LOCK:
+        warmer = _GLOBAL_LOOKAHEAD_WARMER
+        _LOOKAHEAD_FUTURES.pop(batch_id, None)
+    if warmer is None:
+        return
+    if wait:
+        warmer.finish(batch_id)
+        return
+    with warmer._lock:
+        counts = warmer._live.pop(batch_id, None)
+        if counts is None:
+            return
+        if warmer.keep_finished:
+            warmer._finished.append(counts)
+        if warmer._executor is None:
+            warmer._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lookahead-warm")
+        ex = warmer._executor
+    ex.submit(warmer._reconcile)
+
+
+def close_lookahead_warmer() -> None:
+    """Drain background lookahead futures and close the global ``LookaheadWarmer``."""
+    global _GLOBAL_LOOKAHEAD_WARMER
+    with _FLEET_LOCK:
+        warmer, _GLOBAL_LOOKAHEAD_WARMER = _GLOBAL_LOOKAHEAD_WARMER, None
+        _LOOKAHEAD_FUTURES.clear()
+        _PINNED_EVAL_IMAGES.clear()
+    if warmer is not None:
+        warmer.close()
+
+
+class PrewarmBatchIterator:
+    """2-slot sliding lookahead iterator modeled after JAX MLPerf's ``PrewarmDatasetIterator``.
+
+    Warms Step 1 synchronously on ``prime()``, then on each ``next_batch()`` returns the
+    already-warmed batch for Step ``k`` while prefetching and warming Step ``k + 1`` in
+    the background. Calling ``finish_oldest_inflight_batch()`` when Step ``k`` completes
+    tears down Step ``k``'s pools while keeping ``eval_pinned`` and Step ``k + 1`` warm.
+    """
+
+    def __init__(
+        self,
+        fetch_batch_fn: Callable[[], Any] | Any,
+        *,
+        extract_images_fn: Callable[[Any], list[str]] = extract_sandbox_images,
+        ensure_warm_fn: Callable[..., Any] = ensure_lookahead_batch_warm,
+        prefetch_async_fn: Callable[..., Any] | None = None,
+        prefetch_fn: Callable[..., Any] | None = None,
+        finish_batch_fn: Callable[..., Any] | None = None,
+        finish_fn: Callable[..., Any] | None = None,
+        replicas_override: int | None = None,
+    ) -> None:
+        if callable(fetch_batch_fn):
+            self._fetch_batch_fn = fetch_batch_fn
+        else:
+            source = fetch_batch_fn
+            it_state = [iter(source)]
+
+            def _next_from_iterable() -> Any:
+                try:
+                    return next(it_state[0])
+                except StopIteration:
+                    it_state[0] = iter(source)
+                    return next(it_state[0])
+
+            self._fetch_batch_fn = _next_from_iterable
+        self._extract_images_fn = extract_images_fn
+        self._ensure_warm_fn = ensure_warm_fn
+        self._prefetch_async_fn = prefetch_fn or prefetch_async_fn or prefetch_lookahead_batch_async
+        self._finish_batch_fn = finish_fn or finish_batch_fn or finish_lookahead_batch_async
+        self._replicas_override = replicas_override
+        self._next_batch_id = 1
+        self._lookahead: tuple[int | str, Any, list[str]] | None = None
+        self._inflight_batch_ids: collections.deque[int | str] = collections.deque()
+
+    @property
+    def inflight_batch_ids(self) -> list[int | str]:
+        return list(self._inflight_batch_ids)
+
+    @property
+    def lookahead_batch_id(self) -> int | str | None:
+        return self._lookahead[0] if self._lookahead is not None else None
+
+    def prime(self) -> int | str:
+        """Pull the first batch into the lookahead slot and warm its sandboxes synchronously."""
+        if self._lookahead is not None:
+            return self._lookahead[0]
+        batch_id = f"train_step_{self._next_batch_id}"
+        self._next_batch_id += 1
+        batch = self._fetch_batch_fn()
+        images = self._extract_images_fn(batch)
+        if images:
+            self._ensure_warm_fn(batch_id, images, replicas_override=self._replicas_override, wait=True)
+        self._lookahead = (batch_id, batch, images)
+        return batch_id
+
+    def next_batch(self) -> Any:
+        """Return the warmed current batch and start warming the next batch in the background."""
+        if self._lookahead is None:
+            self.prime()
+        assert self._lookahead is not None
+        batch_id, batch, images = self._lookahead
+        self._lookahead = None
+        if images:
+            self._ensure_warm_fn(batch_id, images, replicas_override=self._replicas_override, wait=True)
+
+        next_id = f"train_step_{self._next_batch_id}"
+        self._next_batch_id += 1
+        next_batch_obj = self._fetch_batch_fn()
+        next_images = self._extract_images_fn(next_batch_obj)
+        self._lookahead = (next_id, next_batch_obj, next_images)
+        if next_images:
+            self._prefetch_async_fn(next_id, next_images, replicas_override=self._replicas_override)
+
+        self._inflight_batch_ids.append(batch_id)
+        return batch
+
+    def finish_oldest_inflight_batch(self, *, wait: bool = False) -> int | str | None:
+        """Retire the oldest in-flight batch and unwarm its sandbox pools."""
+        if not self._inflight_batch_ids:
+            return None
+        batch_id = self._inflight_batch_ids.popleft()
+        self._finish_batch_fn(batch_id, wait=wait)
+        return batch_id
+
+
+def ensure_tasks_in_fleet_plan(
+    fleet: Any,
+    tasks: list[Any],
+    *,
+    warm: bool = True,
+    replicas_override: int | None = None,
+) -> None:
+    """Registers ``tasks`` in ``fleet.plan_``, creates warm pools for unwarmed images, and evicts LRU idle pools."""
+    with _FLEET_LOCK:
+        _register_and_warm_locked(fleet, tasks, warm=warm, replicas_override=replicas_override)
+        _evict_excess_warmpools_locked(fleet)
+
+
+def prewarm_sandbox_images(
+    images: list[str],
+    *,
+    replicas_override: int | None = None,
+    namespace: str | None = None,
+    node_selector: dict[str, str] | None = None,
+) -> None:
+    """Pre-warm a batch of sandbox images in parallel and pin them against LRU eviction."""
+    if ClusterConfig is None or FleetConfig is None or SandboxFleet is None or Task is None:
+        return
+    if _is_lookahead_mode_enabled():
+        return
+    normalized = [normalize_sandbox_image(img) for img in images if img]
+    unique_images = list(dict.fromkeys(normalized))
+    if not unique_images:
+        return
+    resolved_ns = _resolve_default_namespace(namespace)
+    resolved_sel = _resolve_default_node_selector(node_selector)
+    task_objs = [Task(id=img, image=img, metadata={"ds": {"docker_image": img}}) for img in unique_images]
+    with _FLEET_LOCK:
+        fleet = _get_or_init_fleet_locked(namespace=resolved_ns, node_selector=resolved_sel)
+        _RECENT_BATCH_IMAGES.append(set(unique_images))
+        _register_and_warm_locked(fleet, task_objs, warm=True, replicas_override=replicas_override)
+        _evict_excess_warmpools_locked(fleet)
+
+
+async def async_prewarm_sandbox_images(
+    images: list[str],
+    *,
+    replicas_override: int | None = None,
+    namespace: str | None = None,
+    node_selector: dict[str, str] | None = None,
+) -> None:
+    """Async wrapper running ``prewarm_sandbox_images`` on the dedicated lifecycle executor."""
+    if not images:
+        return
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        get_lifecycle_executor(),
+        lambda: prewarm_sandbox_images(
+            images,
+            replicas_override=replicas_override,
+            namespace=namespace,
+            node_selector=node_selector,
+        ),
+    )
 
 
 def _acquire_from_fleet(
@@ -139,45 +898,52 @@ def _acquire_from_fleet(
     namespace: str,
     node_selector: dict[str, str] | None,
 ) -> Any:
-    global _GLOBAL_FLEET
-    if ClusterConfig is None or FleetConfig is None or SandboxFleet is None or Task is None:
+    if Task is None:
         raise ImportError("K8sAgentSandbox requires 'agent_sandbox_rl'.")
-    with _FLEET_LOCK:
-        if _GLOBAL_FLEET is None:
-            patch_agent_sandbox_rl_templates()
-            adopt_existing = os.getenv("SANDBOX_ADOPT_EXISTING", "0").lower() in ("1", "true", "yes")
-            run_id = os.getenv("SANDBOX_RUN_ID", "uni-agent-shared").strip() or None
-            cfg = FleetConfig(
-                clusters=[
-                    ClusterConfig(
-                        name="default",
-                        namespace=namespace,
-                        node_selector=node_selector,
-                        in_cluster=os.getenv("KUBERNETES_SERVICE_HOST") is not None,
-                    )
-                ],
-                max_concurrent=128,
-                window_size=8,
-                max_warmpool_size=8,
-                warm_per_task=True,
-                adopt_existing=adopt_existing,
-                run_id=run_id,
-                install_teardown_hooks=True,
-            )
-            _GLOBAL_FLEET = SandboxFleet(cfg)
-            _GLOBAL_FLEET._install_teardown_hooks()
-        fleet = _GLOBAL_FLEET
-
     task_obj = Task(id=image, image=image, metadata={"ds": {"docker_image": image}})
-    ensure_tasks_in_fleet_plan(fleet, [task_obj])
-    for attempt in range(5):
+    with _FLEET_LOCK:
+        fleet = _get_or_init_fleet_locked(namespace=namespace, node_selector=node_selector)
+        _ACTIVE_CLAIMS[image] = _ACTIVE_CLAIMS.get(image, 0) + 1
         try:
-            return fleet.acquire(task_obj)
-        except Exception as exc:
-            if attempt < 4:
-                time.sleep(5 * (attempt + 1))
-            else:
-                raise exc
+            _register_and_warm_locked(fleet, [task_obj], warm=not _is_lookahead_mode_enabled())
+            _evict_excess_warmpools_locked(fleet)
+        except Exception:
+            _ACTIVE_CLAIMS[image] = max(0, _ACTIVE_CLAIMS[image] - 1)
+            if _ACTIVE_CLAIMS[image] == 0:
+                _ACTIVE_CLAIMS.pop(image, None)
+            raise
+
+    try:
+        for attempt in range(5):
+            try:
+                return fleet.acquire(task_obj)
+            except Exception as exc:
+                if attempt < 4:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    raise exc
+    except Exception:
+        with _FLEET_LOCK:
+            _ACTIVE_CLAIMS[image] = max(0, _ACTIVE_CLAIMS.get(image, 0) - 1)
+            if _ACTIVE_CLAIMS[image] == 0:
+                _ACTIVE_CLAIMS.pop(image, None)
+        raise
+
+
+def _release_to_fleet(image: str, handle: Any) -> None:
+    try:
+        if handle is not None and _GLOBAL_FLEET is not None:
+            _GLOBAL_FLEET.release(handle)
+    finally:
+        with _FLEET_LOCK:
+            if image in _ACTIVE_CLAIMS:
+                _ACTIVE_CLAIMS[image] = max(0, _ACTIVE_CLAIMS[image] - 1)
+                if _ACTIVE_CLAIMS[image] == 0:
+                    _ACTIVE_CLAIMS.pop(image, None)
+            if image in _IDLE_LRU:
+                _IDLE_LRU.move_to_end(image)
+            if _GLOBAL_FLEET is not None:
+                _evict_excess_warmpools_locked(_GLOBAL_FLEET)
 
 
 class _K8sStatefulShell:
@@ -196,7 +962,8 @@ class _K8sStatefulShell:
             await self._sandbox.exec_shell(f"cat <<'__EOF__' > {self._env_file}\n{exports}\n__EOF__", timeout=30.0)
             self._initialized = True
         wrapped = (
-            'if [ -d /opt/miniconda3/envs/testbed/bin ]; then export PATH="/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:${PATH}"; fi\n'
+            "if [ -d /opt/miniconda3/envs/testbed/bin ]; then "
+            'export PATH="/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:${PATH}"; fi\n'
             'if [ -d /testbed/.venv/bin ]; then export PATH="/testbed/.venv/bin:${PATH}"; fi\n'
             f"[ -f {self._env_file} ] && . {self._env_file} >/dev/null 2>&1 || true\n"
             f"cd {shlex.quote(self.cwd)} 2>/dev/null || cd /\n"
@@ -212,12 +979,16 @@ class _K8sStatefulShell:
         if m:
             self.cwd = m.group(1).strip() or self.cwd
             stdout = stdout[: m.start()]
-        return ExecResult(exit_code=res.exit_code, stdout=stdout, stderr=res.stderr)
+        return ExecResult(exit_code=res.exit_code, stdout=stdout, stderr=stderr_or_empty(res.stderr))
 
     async def close(self) -> None:
         if self._initialized:
             await self._sandbox.exec(["rm", "-f", self._env_file], timeout=10.0)
             self._initialized = False
+
+
+def stderr_or_empty(val: str | None) -> str:
+    return val or ""
 
 
 @register_sandbox("k8s_agent_sandbox")
@@ -235,17 +1006,11 @@ class K8sAgentSandbox(Sandbox):
         node_selector: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
-        image_prefix = os.getenv("SANDBOX_IMAGE_PREFIX", "").strip().rstrip("/")
-        if image_prefix and "/" in image and image.startswith("namanjain12/"):
-            image = f"{image_prefix}/{image.split('/', 1)[1]}"
-        self.image = image
+        del kwargs
+        self.image = normalize_sandbox_image(image)
         self.runtime_timeout = float(runtime_timeout)
         self.namespace = _resolve_default_namespace(namespace)
-        if node_selector is None:
-            k, v = os.getenv("NODE_SELECTOR_KEY"), os.getenv("NODE_SELECTOR_VAL")
-            self.node_selector = {k: v} if (k and v) else None
-        else:
-            self.node_selector = dict(node_selector)
+        self.node_selector = _resolve_default_node_selector(node_selector)
         self._handle: Any = None
         self._pod_name: str | None = None
         self._started = False
@@ -268,11 +1033,14 @@ class K8sAgentSandbox(Sandbox):
     async def start(self) -> None:
         if self._started:
             return
-        self._handle = await asyncio.to_thread(
-            _acquire_from_fleet,
-            self.image,
-            namespace=self.namespace,
-            node_selector=self.node_selector,
+        loop = asyncio.get_running_loop()
+        self._handle = await loop.run_in_executor(
+            get_lifecycle_executor(),
+            lambda: _acquire_from_fleet(
+                self.image,
+                namespace=self.namespace,
+                node_selector=self.node_selector,
+            ),
         )
         self._pod_name = getattr(self._handle, "pod_name", None)
         if getattr(self._handle, "_cluster", None) is not None:
@@ -283,8 +1051,9 @@ class K8sAgentSandbox(Sandbox):
         self._started = False
         handle, self._handle = self._handle, None
         self._pod_name = None
-        if handle is not None and _GLOBAL_FLEET is not None:
-            await asyncio.to_thread(_GLOBAL_FLEET.release, handle)
+        if handle is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(get_lifecycle_executor(), _release_to_fleet, self.image, handle)
 
     async def is_alive(self) -> bool:
         return self._started and self._handle is not None
@@ -361,7 +1130,8 @@ class K8sAgentSandbox(Sandbox):
         if not self._started or self._handle is None:
             raise RuntimeError("K8sAgentSandbox is not started.")
         eff_timeout = max(float(timeout or 120.0), 1.0)
+        loop = asyncio.get_running_loop()
         return await asyncio.wait_for(
-            asyncio.to_thread(self._exec_in_pod_sync, argv, eff_timeout, workdir, env),
+            loop.run_in_executor(get_exec_executor(), self._exec_in_pod_sync, argv, eff_timeout, workdir, env),
             timeout=eff_timeout + 15.0,
         )
