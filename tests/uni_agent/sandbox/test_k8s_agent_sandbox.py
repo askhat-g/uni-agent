@@ -91,7 +91,9 @@ class _FakeFleet:
     def unwarm_image(self, image: str) -> None:
         self.unwarm_images([image])
 
-    def wait_pools_ready(self, images: list[str], timeout: float | None = None, *, replicas: dict | None = None) -> dict[str, bool]:
+    def wait_pools_ready(
+        self, images: list[str], timeout: float | None = None, *, replicas: dict | None = None
+    ) -> dict[str, bool]:
         del timeout, replicas
         for img in images:
             assert img in self._warmed, f"wait_pools_ready called on unwarmed image {img}"
@@ -421,4 +423,3 @@ def test_cross_actor_lookahead_mode_registers_plan_without_warming(monkeypatch):
         assert [h.pod_name for h in fleet.released] == ["pod-1"]
 
     asyncio.run(_worker_scenario())
-

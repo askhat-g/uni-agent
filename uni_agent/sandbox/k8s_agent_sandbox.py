@@ -382,11 +382,7 @@ def extract_sandbox_images(batch_or_items: Any, *, deduplicate: bool = False) ->
             records = batch_or_items.to_dict(orient="records")
         except TypeError:
             records = list(batch_or_items)
-        images = [
-            normalize_sandbox_image(img)
-            for item in records
-            if (img := _extract_image_from_mapping(item))
-        ]
+        images = [normalize_sandbox_image(img) for item in records if (img := _extract_image_from_mapping(item))]
         return _maybe_dedup_images(images, deduplicate=deduplicate)
     if isinstance(batch_or_items, dict) or hasattr(batch_or_items, "keys"):
         for key in ("tools_kwargs", "extra_info"):
