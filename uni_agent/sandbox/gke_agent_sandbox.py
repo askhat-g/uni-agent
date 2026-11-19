@@ -58,6 +58,21 @@ _PWD_SENTINEL = "__UNI_AGENT_PWD__"
 _DEFAULT_NETWORK_POLICY_MANAGEMENT = "Managed"
 _VALID_NETWORK_POLICY_MODES = ("Managed", "Unmanaged")
 _DENY_ALL_NETWORK_POLICY: dict[str, list[Any]] = {"ingress": [], "egress": []}
+
+# Run as the pod's main command, before any command reaches the sandbox.
+# Pods often have IPv6 disabled while /etc/hosts still maps localhost to ::1. A server that binds "localhost" then
+# fails on ::1 ("cannot assign requested address"), so drop that alias when IPv6 is off.
+_LOCALHOST_IPV4_ONLY = r"""
+if [ "$(cat /proc/sys/net/ipv6/conf/lo/disable_ipv6 2>/dev/null)" = 1 ]; then
+  grep -v '^::1' /etc/hosts > /tmp/.hosts.new 2>/dev/null && cat /tmp/.hosts.new > /etc/hosts 2>/dev/null
+  rm -f /tmp/.hosts.new
+fi
+"""
+# Under a deny-all policy DNS packets are dropped, so every hostname lookup blocks for about 20 s before failing.
+# Pointing the resolver at loopback, where nothing listens, makes lookups fail at once instead.
+_FAIL_FAST_DNS = r"""
+printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' > /etc/resolv.conf 2>/dev/null
+"""
 _AGENT_SANDBOX_RL_INSTALL_HINT = (
     "GKEAgentSandbox requires 'agent_sandbox_rl', which is not installed. "
     "Install the 'gke' extra from a uni-agent checkout (pip install -e '.[gke]') and 'agent-sandbox-rl' "
@@ -489,11 +504,16 @@ def _get_or_init_fleet_locked(
         "run_id": run_id,
         "install_teardown_hooks": True,
     }
+    # The provider knows the pod has no egress only when it manages the policy itself and that policy has no
+    # egress rule. An operator-managed (Unmanaged) policy may allow DNS, so the resolver is left alone there.
+    no_egress = resolved_np_mgmt == "Managed" and not resolved_np.get("egress")
+    startup_script = _LOCALHOST_IPV4_ONLY + (_FAIL_FAST_DNS if no_egress else "") + "exec sleep infinity\n"
     template_kwargs: dict[str, Any] = {
         "colocate_replicas": colocate_replicas,
         "network_policy_management": resolved_np_mgmt,
         "automount_service_account_token": False,
         "share_process_namespace": False,
+        "keepalive_command": ["/bin/sh", "-c", startup_script],
     }
     if node_selector:
         template_kwargs["extra_pod_spec"] = {
