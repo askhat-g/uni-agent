@@ -1011,3 +1011,56 @@ def test_claim_is_kept_when_the_lifecycle_patch_cannot_be_built(monkeypatch):
     assert handle.claim_name == "claim-1"
     assert acquired == ["img:1"]
     assert gke_sb_mod._GLOBAL_FLEET.custom_api.patches == []
+
+
+def test_pod_startup_command_adapts_localhost_and_dns_to_the_network_policy(monkeypatch, tmp_path):
+    monkeypatch.setattr(gke_sb_mod, "_verify_unmanaged_network_policy", lambda namespace, labels: None)
+
+    def startup_script(**kwargs) -> str:
+        _reset_fleet_globals(monkeypatch)
+        fleet = gke_sb_mod._get_or_init_fleet_locked(namespace="default", node_selector=None, **kwargs)
+        command = fleet.config.template.keepalive_command
+        assert command[:2] == ["/bin/sh", "-c"]
+        assert command[2].rstrip().endswith("exec sleep infinity")
+        subprocess.run(["sh", "-n", "-c", command[2]], check=True)  # valid shell
+        return command[2]
+
+    offline = startup_script()  # default: managed deny-all policy
+    with_egress = startup_script(network_policy={"ingress": [], "egress": [{}]})
+    unmanaged = startup_script(network_policy_management="Unmanaged")
+    # Lookups are made to fail fast only when the provider itself blocks all egress.
+    assert "resolv.conf" in offline
+    assert "resolv.conf" not in with_egress
+    assert "resolv.conf" not in unmanaged
+
+    def run(script: str, *, ipv6_disabled: str | None) -> tuple[str, str]:
+        """Run the script against a fake /etc and IPv6 flag; return the resulting hosts and resolv.conf."""
+        etc = tmp_path / "etc"
+        etc.mkdir(exist_ok=True)
+        (etc / "hosts").write_text("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n10.0.0.5\tpod-a\n")
+        (etc / "resolv.conf").write_text("search cluster.local\nnameserver 10.1.2.3\noptions ndots:5\n")
+        flag = tmp_path / "disable_ipv6"
+        flag.unlink(missing_ok=True)
+        if ipv6_disabled is not None:
+            flag.write_text(ipv6_disabled + "\n")
+        local = (
+            script.replace("/etc/", f"{etc}/")
+            .replace("/proc/sys/net/ipv6/conf/lo/disable_ipv6", str(flag))
+            .replace("exec sleep infinity", "true")
+        )
+        subprocess.run(["sh", "-c", local], check=True)
+        return (etc / "hosts").read_text(), (etc / "resolv.conf").read_text()
+
+    hosts, resolv = run(offline, ipv6_disabled="1")
+    assert hosts == "127.0.0.1\tlocalhost\n10.0.0.5\tpod-a\n"
+    assert resolv == "nameserver 127.0.0.1\noptions timeout:1 attempts:1\n"
+
+    # IPv6 available (or the flag unreadable): localhost keeps its ::1 alias.
+    for flag_value in ("0", None):
+        hosts, _ = run(offline, ipv6_disabled=flag_value)
+        assert "::1\tlocalhost" in hosts
+
+    # A sandbox with egress keeps its resolver, but still gets the localhost fix when IPv6 is off.
+    hosts, resolv = run(with_egress, ipv6_disabled="1")
+    assert "::1" not in hosts
+    assert resolv == "search cluster.local\nnameserver 10.1.2.3\noptions ndots:5\n"
